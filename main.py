@@ -470,8 +470,10 @@ def run_server(port: int = 5050):
 
     app = Flask(__name__)
 
-    @app.route("/webhook/audit", methods=["POST"])
+    @app.route("/webhook/audit", methods=["GET", "POST"])
     def receive_lead():
+        if request.method == "GET":
+            return jsonify({"status": "ok"}), 200
         # Accept JSON or form-encoded data
         data = request.get_json(silent=True) or request.form.to_dict()
 
