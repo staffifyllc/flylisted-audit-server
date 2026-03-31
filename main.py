@@ -476,21 +476,24 @@ def run_server(port: int = 5050):
             return jsonify({"status": "ok"}), 200
         # Accept JSON or form-encoded data
         data = request.get_json(silent=True) or request.form.to_dict()
+        print(f"  Webhook payload keys: {list(data.keys())}")
+        print(f"  Webhook payload: {data}")
 
-        # Normalize common field name variations (Mailchimp, Typeform, etc.)
+        # Mailchimp sends nested keys like data[email], data[merges][FNAME], etc.
+        def mc(key):
+            return data.get(f"data[{key}]") or data.get(f"data[merges][{key}]") or ""
+
         lead = {
-            "name":          (data.get("name") or data.get("FNAME") or data.get("first_name") or ""),
-            "email":         (data.get("email") or data.get("EMAIL") or ""),
-            "instagram":     (data.get("instagram") or data.get("INSTAGRAM") or data.get("MERGE2") or ""),
-            "business_name": (data.get("business_name") or data.get("business") or data.get("MERGE3") or ""),
-            "website":       (data.get("website") or data.get("WEBSITE") or data.get("MERGE4") or ""),
-            "industry":      (data.get("industry") or data.get("INDUSTRY") or data.get("MERGE5") or ""),
+            "name":          (mc("FNAME") or mc("first_name") or data.get("name") or data.get("FNAME") or ""),
+            "email":         (mc("EMAIL") or mc("email") or data.get("email") or data.get("EMAIL") or ""),
+            "instagram":     (mc("INSTAGRAM") or mc("MERGE2") or data.get("instagram") or data.get("INSTAGRAM") or data.get("MERGE2") or ""),
+            "business_name": (mc("MERGE3") or data.get("business_name") or ""),
+            "website":       (mc("MERGE4") or data.get("website") or ""),
+            "industry":      (mc("MERGE5") or data.get("industry") or ""),
         }
 
         if not lead["email"]:
             return jsonify({"error": "email is required"}), 400
-        if not lead["instagram"]:
-            return jsonify({"error": "instagram handle is required"}), 400
 
         # Fire-and-forget in background thread so webhook returns immediately
         thread = threading.Thread(target=process_lead, args=(lead,), daemon=True)
