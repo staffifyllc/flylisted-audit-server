@@ -359,7 +359,10 @@ def send_email(to_email: str, to_name: str, subject: str, html: str, plain: str 
         return True
 
     payload = {
-        "personalizations": [{"to": [{"email": to_email, "name": to_name}]}],
+        "personalizations": [{
+            "to": [{"email": to_email, "name": to_name}],
+            "cc": [{"email": "info@flylisted.com", "name": "FlyListed"}],
+        }],
         "from": {"email": FROM_EMAIL, "name": FROM_NAME},
         "subject": subject,
         "content": [
