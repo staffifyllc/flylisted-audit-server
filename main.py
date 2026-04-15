@@ -35,6 +35,7 @@ import argparse
 import threading
 import urllib.request
 import json
+import time
 
 import anthropic
 
@@ -155,13 +156,27 @@ Then write the audit based on what you actually find. Be specific — reference 
 
     # Agentic loop — server-side tools may pause_turn if they need more iterations
     for _ in range(6):
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
-            system=AUDIT_SYSTEM_PROMPT,
-            tools=tools,
-            messages=messages,
-        )
+        # Retry up to 5 times on overload/rate limit
+        for attempt in range(5):
+            try:
+                response = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=4096,
+                    system=AUDIT_SYSTEM_PROMPT,
+                    tools=tools,
+                    messages=messages,
+                )
+                break
+            except Exception as e:
+                if "overloaded" in str(e).lower() or "529" in str(e) or "429" in str(e):
+                    wait = 30 * (attempt + 1)
+                    print(f"  API busy, retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    raise
+        else:
+            print("  API still unavailable after retries")
+            return {}
 
         messages.append({"role": "assistant", "content": response.content})
 
