@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 FlyListed Social Media Audit Generator
-Researches a lead's Instagram/web presence and emails a personalized audit.
-7 days later, sends an automatic follow-up with a booking link.
+- Sends personalized audit on form submission
+- Follows up every 7 days until lead unsubscribes or books a call
 """
 
 import os
@@ -11,6 +11,7 @@ import sys
 import argparse
 import threading
 import urllib.request
+import urllib.parse
 import json
 import time
 import sqlite3
@@ -23,17 +24,16 @@ import anthropic
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
 FROM_EMAIL       = os.environ.get("FROM_EMAIL", "social@flylisted.com")
 FROM_NAME        = os.environ.get("FROM_NAME", "Paul at FlyListed")
+SERVER_URL       = os.environ.get("SERVER_URL", "https://web-production-7aaedd.up.railway.app")
 
 BOOK_LINK  = "https://meetings.hubspot.com/paul-chareth?uuid=fb531c6b-0387-4837-b09a-5e5d52bc2e67"
-FOLLOWUP_DELAY_DAYS = 7
+FOLLOWUP_INTERVAL_DAYS = 7
 
 DB_PATH = os.environ.get("DB_PATH", "/data/leads.db")
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 
 def get_db():
-    """Return a database connection, creating the DB and table if needed."""
-    # Fall back to local path if /data doesn't exist
     db_path = DB_PATH
     db_dir = os.path.dirname(db_path)
     if db_dir and not os.path.exists(db_dir):
@@ -42,56 +42,90 @@ def get_db():
     conn = sqlite3.connect(db_path)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS leads (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            email         TEXT UNIQUE NOT NULL,
-            name          TEXT,
-            instagram     TEXT,
-            audit_sent_at TEXT,
-            followup_sent INTEGER DEFAULT 0,
-            created_at    TEXT DEFAULT (datetime('now'))
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            email            TEXT UNIQUE NOT NULL,
+            name             TEXT,
+            instagram        TEXT,
+            audit_sent_at    TEXT,
+            followup_count   INTEGER DEFAULT 0,
+            next_followup_at TEXT,
+            unsubscribed     INTEGER DEFAULT 0,
+            created_at       TEXT DEFAULT (datetime('now'))
         )
     """)
+    # Migrate old schema if needed
+    try:
+        conn.execute("ALTER TABLE leads ADD COLUMN followup_count INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE leads ADD COLUMN next_followup_at TEXT")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE leads ADD COLUMN unsubscribed INTEGER DEFAULT 0")
+    except Exception:
+        pass
     conn.commit()
     return conn
 
 
 def save_lead(lead: dict):
-    """Record that we sent an audit to this lead."""
+    """Record that we sent an audit; schedule first follow-up in 7 days."""
     conn = get_db()
+    next_followup = (datetime.utcnow() + timedelta(days=FOLLOWUP_INTERVAL_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
     try:
         conn.execute("""
-            INSERT INTO leads (email, name, instagram, audit_sent_at)
-            VALUES (?, ?, ?, datetime('now'))
+            INSERT INTO leads (email, name, instagram, audit_sent_at, followup_count, next_followup_at)
+            VALUES (?, ?, ?, datetime('now'), 0, ?)
             ON CONFLICT(email) DO UPDATE SET
-                audit_sent_at = datetime('now'),
-                followup_sent = 0
-        """, (lead.get("email", ""), lead.get("name", ""), lead.get("instagram", "")))
+                audit_sent_at    = datetime('now'),
+                followup_count   = 0,
+                next_followup_at = ?,
+                unsubscribed     = 0
+        """, (lead.get("email", ""), lead.get("name", ""), lead.get("instagram", ""), next_followup, next_followup))
         conn.commit()
     finally:
         conn.close()
 
 
-def get_followup_due() -> list:
-    """Return leads whose follow-up is due (audit sent 7+ days ago, not yet followed up)."""
+def get_followups_due() -> list:
+    """Return leads whose next follow-up is due and haven't unsubscribed."""
     conn = get_db()
     try:
-        cutoff = (datetime.utcnow() - timedelta(days=FOLLOWUP_DELAY_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         rows = conn.execute("""
-            SELECT email, name, instagram FROM leads
-            WHERE followup_sent = 0
-              AND audit_sent_at IS NOT NULL
-              AND audit_sent_at <= ?
-        """, (cutoff,)).fetchall()
-        return [{"email": r[0], "name": r[1], "instagram": r[2]} for r in rows]
+            SELECT email, name, instagram, followup_count FROM leads
+            WHERE unsubscribed = 0
+              AND next_followup_at IS NOT NULL
+              AND next_followup_at <= ?
+        """, (now,)).fetchall()
+        return [{"email": r[0], "name": r[1], "instagram": r[2], "followup_count": r[3]} for r in rows]
     finally:
         conn.close()
 
 
 def mark_followup_sent(email: str):
-    """Mark this lead's follow-up as sent."""
+    """Increment followup count and schedule next one in 7 days."""
+    conn = get_db()
+    next_followup = (datetime.utcnow() + timedelta(days=FOLLOWUP_INTERVAL_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        conn.execute("""
+            UPDATE leads
+            SET followup_count   = followup_count + 1,
+                next_followup_at = ?
+            WHERE email = ?
+        """, (next_followup, email))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def unsubscribe_lead(email: str):
+    """Mark a lead as unsubscribed so no more follow-ups are sent."""
     conn = get_db()
     try:
-        conn.execute("UPDATE leads SET followup_sent = 1 WHERE email = ?", (email,))
+        conn.execute("UPDATE leads SET unsubscribed = 1 WHERE email = ?", (email,))
         conn.commit()
     finally:
         conn.close()
@@ -175,7 +209,6 @@ CLOSING: [closing paragraph with soft CTA]"""
 # ─── Audit Generation ─────────────────────────────────────────────────────────
 
 def generate_audit(lead: dict) -> dict:
-    """Call Claude with web search tools to research and generate the audit."""
     client = anthropic.Anthropic()
 
     instagram = lead.get("instagram", "").strip().lstrip("@")
@@ -247,7 +280,6 @@ Then write the audit based on what you actually find. Be specific — reference 
 
 
 def parse_audit(text: str) -> dict:
-    """Extract structured fields from Claude's marked-up output."""
     def extract(marker):
         pattern = rf"^{marker}:\s*(.+)$"
         m = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
@@ -269,10 +301,27 @@ def parse_audit(text: str) -> dict:
     }
 
 
-# ─── Email HTML ───────────────────────────────────────────────────────────────
+# ─── Email Helpers ────────────────────────────────────────────────────────────
 
-def build_html(audit: dict) -> str:
-    """Build FlyListed-branded HTML email from parsed audit data."""
+def unsubscribe_link(email: str) -> str:
+    encoded = urllib.parse.quote(email)
+    return f"{SERVER_URL}/unsubscribe?email={encoded}"
+
+
+def footer_html(email: str) -> str:
+    unsub = unsubscribe_link(email)
+    return f"""
+  <tr><td style="background:#f9f9f9;border-top:1px solid #eee;padding:20px 40px;text-align:center;">
+    <p style="font-size:12px;color:#aaa;margin:0 0 8px 0;">FlyListed &bull; You requested a free Instagram audit from our website.</p>
+    <p style="font-size:11px;color:#ccc;margin:0;">
+      <a href="{unsub}" style="color:#ccc;text-decoration:underline;">Unsubscribe</a>
+    </p>
+  </td></tr>"""
+
+
+# ─── Audit Email HTML ─────────────────────────────────────────────────────────
+
+def build_html(audit: dict, to_email: str = "") -> str:
 
     def score_badge(value, colors):
         return (
@@ -316,88 +365,51 @@ def build_html(audit: dict) -> str:
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#f0f0f0;padding:24px 0;">
 <tr><td align="center">
 <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:4px;overflow:hidden;max-width:600px;width:100%;">
-
-  <!-- Header -->
   <tr><td style="background:#000000;padding:28px 40px;text-align:center;">
     <div style="color:#ffffff;font-size:20px;font-weight:700;letter-spacing:3px;">FLYLISTED</div>
     <div style="color:#666;font-size:11px;letter-spacing:3px;margin-top:4px;text-transform:uppercase;">Social Media Audit</div>
   </td></tr>
-
-  <!-- Gradient bar -->
   <tr><td style="height:4px;background:linear-gradient(135deg,#833ab4,#fd1d1d,#fcb045);font-size:0;">&nbsp;</td></tr>
-
-  <!-- Body -->
   <tr><td style="padding:40px;">
-
     <p style="font-size:15px;color:#222;margin:0 0 8px 0;font-weight:600;">{greeting}</p>
     <p style="font-size:15px;color:#444;line-height:1.7;margin:0 0 36px 0;">{intro}</p>
-
-    <!-- Scores -->
     <table width="100%" cellpadding="0" cellspacing="0" style="background:#000;border-radius:10px;padding:0;margin-bottom:36px;">
     <tr><td style="padding:28px;">
       <div style="color:#777;font-size:10px;letter-spacing:2.5px;text-transform:uppercase;margin-bottom:18px;">First-Look Scores</div>
       <table width="100%" cellpadding="0" cellspacing="0">
-        <tr>
-          <td style="padding:8px 0;color:#bbb;font-size:14px;">Brand Clarity</td>
-          <td align="right">{s_brand}</td>
-        </tr>
-        <tr>
-          <td style="padding:8px 0;color:#bbb;font-size:14px;">Content Consistency</td>
-          <td align="right">{s_consist}</td>
-        </tr>
-        <tr>
-          <td style="padding:8px 0;color:#bbb;font-size:14px;">Trust &amp; Authority</td>
-          <td align="right">{s_trust}</td>
-        </tr>
+        <tr><td style="padding:8px 0;color:#bbb;font-size:14px;">Brand Clarity</td><td align="right">{s_brand}</td></tr>
+        <tr><td style="padding:8px 0;color:#bbb;font-size:14px;">Content Consistency</td><td align="right">{s_consist}</td></tr>
+        <tr><td style="padding:8px 0;color:#bbb;font-size:14px;">Trust &amp; Authority</td><td align="right">{s_trust}</td></tr>
       </table>
     </td></tr>
     </table>
-
-    <!-- What's Working -->
     <div style="margin-bottom:28px;">
       {section_header("What&#39;s Working", "#833ab4")}
       <ul style="margin:0;padding-left:20px;">{working}</ul>
     </div>
-
-    <!-- What May Be Holding Things Back -->
     <div style="margin-bottom:28px;">
       {section_header("What May Be Holding Things Back", "#fd1d1d")}
       <ul style="margin:0;padding-left:20px;">{holding}</ul>
     </div>
-
-    <!-- What We'd Improve First -->
     <div style="margin-bottom:36px;">
       {section_header("What We&#39;d Improve First", "#fcb045")}
       <ul style="margin:0;padding-left:20px;">{improve}</ul>
     </div>
-
-    <!-- Closing -->
     <p style="font-size:15px;color:#444;line-height:1.7;margin:0 0 32px 0;">{closing}</p>
-
-    <!-- CTA -->
     <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:36px;">
     <tr><td align="center">
-      <a href="{BOOK_LINK}"
-         style="display:inline-block;background:linear-gradient(135deg,#833ab4,#fd1d1d,#fcb045);color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:14px 36px;border-radius:8px;letter-spacing:0.5px;">
+      <a href="{BOOK_LINK}" style="display:inline-block;background:linear-gradient(135deg,#833ab4,#fd1d1d,#fcb045);color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:14px 36px;border-radius:8px;letter-spacing:0.5px;">
         Book a Strategy Call
       </a>
     </td></tr>
     </table>
-
-    <!-- Signature -->
     <p style="font-size:14px;color:#555;line-height:1.6;margin:0;">
       Paul Chareth<br>
       <span style="color:#999;">FlyListed &mdash; Social Media Built for Growth</span><br>
       <a href="https://content.flylisted.com" style="color:#833ab4;text-decoration:none;font-size:13px;">content.flylisted.com</a>
     </p>
-
   </td></tr>
-
-  <!-- Footer -->
-  <tr><td style="background:#f9f9f9;border-top:1px solid #eee;padding:20px 40px;text-align:center;">
-    <p style="font-size:12px;color:#aaa;margin:0;">FlyListed &bull; You requested a free Instagram audit from our website.</p>
-  </td></tr>
-
+  {footer_html(to_email)}
 </table>
 </td></tr>
 </table>
@@ -405,130 +417,147 @@ def build_html(audit: dict) -> str:
 </html>"""
 
 
-# ─── Follow-up Email ──────────────────────────────────────────────────────────
+# ─── Follow-up Email HTML ─────────────────────────────────────────────────────
 
-def build_followup_html(name: str) -> str:
-    """Build a short follow-up email nudging the lead to book a call."""
-    first = name.split()[0] if name else "there"
-    return f"""<!DOCTYPE html>
+# Different messages for each week so they don't feel repetitive
+FOLLOWUP_VARIANTS = [
+    {
+        "subject": "Hey {first} — did you get a chance to look at your audit?",
+        "body": (
+            "I sent over your social media audit last week and wanted to check in — "
+            "did you get a chance to look it over?\n\n"
+            "If anything resonated or you have questions about the recommendations, "
+            "I'd love to walk you through what we'd actually do for your brand. "
+            "No pressure — just a quick call to see if there's a fit."
+        ),
+        "cta": "Book a Strategy Call",
+    },
+    {
+        "subject": "Still thinking about it, {first}?",
+        "body": (
+            "Just following up on the audit I sent a couple weeks back. "
+            "A few of the things we flagged — especially around content consistency and trust signals — "
+            "are pretty quick wins once you have the right system in place.\n\n"
+            "If you've been on the fence, sometimes it just takes a 20-minute call to get clarity "
+            "on what's actually worth your time and what isn't."
+        ),
+        "cta": "Grab a Time to Talk",
+    },
+    {
+        "subject": "One thing I'd fix first on your profile, {first}",
+        "body": (
+            "I've been thinking about your profile since I sent the audit. "
+            "If I had to pick one thing to fix first, it would be tightening up the bio and link strategy — "
+            "that's usually the highest-leverage change for converting profile visitors into leads.\n\n"
+            "Happy to walk you through exactly how we'd approach it on a quick call."
+        ),
+        "cta": "Book a 20-Min Call",
+    },
+    {
+        "subject": "Last thing I'll say, {first}",
+        "body": (
+            "I don't want to keep showing up in your inbox if the timing isn't right — "
+            "so this is the last nudge for a while.\n\n"
+            "If you ever want to revisit working together, the link below is always open. "
+            "And if you'd rather I stop reaching out, just click unsubscribe below — no hard feelings at all."
+        ),
+        "cta": "Book a Call Whenever You're Ready",
+    },
+]
+
+
+def get_followup_variant(followup_count: int) -> dict:
+    """Cycle through variants, repeating the last one after we run out."""
+    idx = min(followup_count, len(FOLLOWUP_VARIANTS) - 1)
+    return FOLLOWUP_VARIANTS[idx]
+
+
+def build_followup_html(name: str, followup_count: int, to_email: str) -> tuple:
+    """Returns (subject, html, plain) for a follow-up email."""
+    first   = name.split()[0] if name else "there"
+    variant = get_followup_variant(followup_count)
+
+    subject = variant["subject"].format(first=first)
+    body    = variant["body"]
+    cta     = variant["cta"]
+
+    html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Following Up — FlyListed</title>
 </head>
 <body style="margin:0;padding:0;background:#f0f0f0;font-family:'Inter',Arial,sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#f0f0f0;padding:24px 0;">
 <tr><td align="center">
 <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:4px;overflow:hidden;max-width:600px;width:100%;">
-
-  <!-- Header -->
   <tr><td style="background:#000000;padding:28px 40px;text-align:center;">
     <div style="color:#ffffff;font-size:20px;font-weight:700;letter-spacing:3px;">FLYLISTED</div>
-    <div style="color:#666;font-size:11px;letter-spacing:3px;margin-top:4px;text-transform:uppercase;">Following Up</div>
   </td></tr>
-
-  <!-- Gradient bar -->
   <tr><td style="height:4px;background:linear-gradient(135deg,#833ab4,#fd1d1d,#fcb045);font-size:0;">&nbsp;</td></tr>
-
-  <!-- Body -->
   <tr><td style="padding:40px;">
-
     <p style="font-size:15px;color:#222;margin:0 0 20px 0;font-weight:600;">Hi {first},</p>
-
-    <p style="font-size:15px;color:#444;line-height:1.7;margin:0 0 20px 0;">
-      I sent over your social media audit last week and wanted to check in — did you get a chance to look it over?
-    </p>
-
-    <p style="font-size:15px;color:#444;line-height:1.7;margin:0 0 20px 0;">
-      If anything resonated or you have questions about the recommendations, I'd love to walk you through what we'd actually do for your brand. No pressure — just a quick call to see if there's a fit.
-    </p>
-
-    <p style="font-size:15px;color:#444;line-height:1.7;margin:0 0 32px 0;">
-      You can grab a time below whenever it works for you.
-    </p>
-
-    <!-- CTA -->
-    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:36px;">
+    {''.join(f'<p style="font-size:15px;color:#444;line-height:1.7;margin:0 0 20px 0;">{para}</p>' for para in body.split(chr(10)+chr(10)))}
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin:32px 0;">
     <tr><td align="center">
-      <a href="{BOOK_LINK}"
-         style="display:inline-block;background:linear-gradient(135deg,#833ab4,#fd1d1d,#fcb045);color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:14px 36px;border-radius:8px;letter-spacing:0.5px;">
-        Book a Strategy Call
+      <a href="{BOOK_LINK}" style="display:inline-block;background:linear-gradient(135deg,#833ab4,#fd1d1d,#fcb045);color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:14px 36px;border-radius:8px;letter-spacing:0.5px;">
+        {cta}
       </a>
     </td></tr>
     </table>
-
-    <!-- Signature -->
     <p style="font-size:14px;color:#555;line-height:1.6;margin:0;">
       Paul Chareth<br>
       <span style="color:#999;">FlyListed &mdash; Social Media Built for Growth</span><br>
       <a href="https://content.flylisted.com" style="color:#833ab4;text-decoration:none;font-size:13px;">content.flylisted.com</a>
     </p>
-
   </td></tr>
-
-  <!-- Footer -->
-  <tr><td style="background:#f9f9f9;border-top:1px solid #eee;padding:20px 40px;text-align:center;">
-    <p style="font-size:12px;color:#aaa;margin:0;">FlyListed &bull; You requested a free Instagram audit from our website.</p>
-  </td></tr>
-
+  {footer_html(to_email)}
 </table>
 </td></tr>
 </table>
 </body>
 </html>"""
 
+    plain = f"Hi {first},\n\n{body}\n\n{cta}: {BOOK_LINK}\n\nPaul Chareth\nFlyListed\n\nUnsubscribe: {unsubscribe_link(to_email)}"
 
-def send_followup(lead: dict):
-    """Send the 7-day follow-up email."""
-    name  = lead.get("name", "")
-    email = lead.get("email", "")
-    first = name.split()[0] if name else "there"
-    subject = f"Hey {first} — did you get a chance to look at your audit?"
-    html    = build_followup_html(name)
-    plain   = (
-        f"Hi {first},\n\n"
-        "I sent over your social media audit last week and wanted to check in — "
-        "did you get a chance to look it over?\n\n"
-        "If anything resonated or you have questions, I'd love to walk you through "
-        "what we'd actually do for your brand.\n\n"
-        f"Book a call here: {BOOK_LINK}\n\n"
-        "Paul Chareth\nFlyListed"
-    )
-    print(f"  Sending follow-up to {email}...")
-    if send_email(email, name, subject, html, plain):
-        mark_followup_sent(email)
-        print(f"  Follow-up sent to {email}")
+    return subject, html, plain
 
 
 # ─── Follow-up Scheduler ──────────────────────────────────────────────────────
 
+def send_followup(lead: dict):
+    email          = lead.get("email", "")
+    name           = lead.get("name", "")
+    followup_count = lead.get("followup_count", 0)
+
+    subject, html, plain = build_followup_html(name, followup_count, email)
+    print(f"  Sending follow-up #{followup_count + 1} to {email}...")
+
+    if send_email(email, name, subject, html, plain):
+        mark_followup_sent(email)
+        print(f"  Follow-up #{followup_count + 1} sent to {email}")
+
+
 def run_followup_scheduler():
     """Background thread: check every hour for follow-ups due."""
-    print("  Follow-up scheduler started (checks every hour)")
+    print("  Follow-up scheduler running (checks every hour)")
     while True:
         try:
-            due = get_followup_due()
+            due = get_followups_due()
             if due:
                 print(f"  {len(due)} follow-up(s) due")
                 for lead in due:
                     send_followup(lead)
         except Exception as e:
-            print(f"  Follow-up scheduler error: {e}")
-        time.sleep(3600)  # check every hour
+            print(f"  Scheduler error: {e}")
+        time.sleep(3600)
 
 
 # ─── Email Sending ────────────────────────────────────────────────────────────
 
 def send_email(to_email: str, to_name: str, subject: str, html: str, plain: str = "") -> bool:
-    """Send email via SendGrid API."""
     if not SENDGRID_API_KEY:
-        print("\n" + "="*60)
-        print("SendGrid not configured — printing audit instead of sending.")
-        print(f"To: {to_name} <{to_email}>")
-        print(f"Subject: {subject}")
-        print("="*60)
-        print(plain or "[see HTML output]")
+        print(f"\nTo: {to_name} <{to_email}>\nSubject: {subject}\n{plain}")
         return True
 
     payload = {
@@ -570,7 +599,6 @@ def send_email(to_email: str, to_name: str, subject: str, html: str, plain: str 
 # ─── Full Pipeline ────────────────────────────────────────────────────────────
 
 def process_lead(lead: dict) -> bool:
-    """Research lead, generate audit, build email, send, record for follow-up."""
     name  = lead.get("name", "there")
     email = lead.get("email", "").strip()
 
@@ -594,14 +622,13 @@ def process_lead(lead: dict) -> bool:
         return False
 
     print("  Building email...")
-    html = build_html(audit)
-
+    html    = build_html(audit, to_email=email)
     subject = audit.get("subject") or "Your Free Instagram Audit — Here's What We Found"
     plain   = audit.get("raw", "")
 
     success = send_email(email, name, subject, html, plain)
     if success:
-        save_lead(lead)  # record for 7-day follow-up
+        save_lead(lead)
     return success
 
 
@@ -640,7 +667,6 @@ def cli():
 # ─── Webhook Server ───────────────────────────────────────────────────────────
 
 def run_server(port: int = 5050):
-    """Run a simple Flask webhook server for form integration."""
     try:
         from flask import Flask, request, jsonify
     except ImportError:
@@ -649,9 +675,8 @@ def run_server(port: int = 5050):
 
     app = Flask(__name__)
 
-    # Start follow-up scheduler in background
-    scheduler = threading.Thread(target=run_followup_scheduler, daemon=True)
-    scheduler.start()
+    # Start follow-up scheduler
+    threading.Thread(target=run_followup_scheduler, daemon=True).start()
 
     @app.route("/webhook/audit", methods=["GET", "POST"])
     def receive_lead():
@@ -676,18 +701,25 @@ def run_server(port: int = 5050):
         if not lead["email"]:
             return jsonify({"error": "email is required"}), 400
 
-        thread = threading.Thread(target=process_lead, args=(lead,), daemon=True)
-        thread.start()
-
+        threading.Thread(target=process_lead, args=(lead,), daemon=True).start()
         return jsonify({"status": "processing", "message": "Audit generation started"}), 200
+
+    @app.route("/unsubscribe", methods=["GET"])
+    def unsubscribe():
+        email = request.args.get("email", "").strip()
+        if email:
+            unsubscribe_lead(email)
+            print(f"  Unsubscribed: {email}")
+        return """<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;text-align:center;padding:60px;">
+<h2>You've been unsubscribed.</h2>
+<p style="color:#666;">You won't receive any more emails from FlyListed.<br>If this was a mistake, reply to any of our emails and we'll add you back.</p>
+</body></html>"""
 
     @app.route("/health", methods=["GET"])
     def health():
         return jsonify({"status": "ok", "service": "flylisted-audit-generator"}), 200
 
     print(f"\nFlyListed Audit Generator running on port {port}")
-    print(f"POST to: http://localhost:{port}/webhook/audit")
-    print(f"Health:  http://localhost:{port}/health\n")
     app.run(host="0.0.0.0", port=port, debug=False)
 
 
