@@ -2,30 +2,7 @@
 """
 FlyListed Social Media Audit Generator
 Researches a lead's Instagram/web presence and emails a personalized audit.
-
-SETUP:
-  pip install anthropic flask
-
-  Set these environment variables (or create a .env file and load it):
-    ANTHROPIC_API_KEY   — your Anthropic API key
-    SMTP_HOST           — e.g. smtp.gmail.com
-    SMTP_PORT           — 587
-    SMTP_USER           — your sending email address
-    SMTP_PASS           — email password or app password
-    FROM_EMAIL          — paul@flylisted.com
-    FROM_NAME           — Paul at FlyListed
-
-CLI USAGE (test a single lead):
-  python flylisted-audit-generator.py \
-    --name "Sarah Johnson" \
-    --email "sarah@example.com" \
-    --instagram "@sarahjohnsonrealty" \
-    --industry "Real Estate"
-
-WEBHOOK SERVER (connect to Mailchimp / your form):
-  python flylisted-audit-generator.py --server
-  POST to http://localhost:5050/webhook/audit
-  Body: { "name": "...", "email": "...", "instagram": "...", "industry": "..." }
+7 days later, sends an automatic follow-up with a booking link.
 """
 
 import os
@@ -36,6 +13,8 @@ import threading
 import urllib.request
 import json
 import time
+import sqlite3
+from datetime import datetime, timedelta
 
 import anthropic
 
@@ -46,6 +25,77 @@ FROM_EMAIL       = os.environ.get("FROM_EMAIL", "social@flylisted.com")
 FROM_NAME        = os.environ.get("FROM_NAME", "Paul at FlyListed")
 
 BOOK_LINK  = "https://meetings.hubspot.com/paul-chareth?uuid=fb531c6b-0387-4837-b09a-5e5d52bc2e67"
+FOLLOWUP_DELAY_DAYS = 7
+
+DB_PATH = os.environ.get("DB_PATH", "/data/leads.db")
+
+# ─── Database ─────────────────────────────────────────────────────────────────
+
+def get_db():
+    """Return a database connection, creating the DB and table if needed."""
+    # Fall back to local path if /data doesn't exist
+    db_path = DB_PATH
+    db_dir = os.path.dirname(db_path)
+    if db_dir and not os.path.exists(db_dir):
+        db_path = os.path.join(os.path.dirname(__file__), "leads.db")
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS leads (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            email         TEXT UNIQUE NOT NULL,
+            name          TEXT,
+            instagram     TEXT,
+            audit_sent_at TEXT,
+            followup_sent INTEGER DEFAULT 0,
+            created_at    TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def save_lead(lead: dict):
+    """Record that we sent an audit to this lead."""
+    conn = get_db()
+    try:
+        conn.execute("""
+            INSERT INTO leads (email, name, instagram, audit_sent_at)
+            VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(email) DO UPDATE SET
+                audit_sent_at = datetime('now'),
+                followup_sent = 0
+        """, (lead.get("email", ""), lead.get("name", ""), lead.get("instagram", "")))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_followup_due() -> list:
+    """Return leads whose follow-up is due (audit sent 7+ days ago, not yet followed up)."""
+    conn = get_db()
+    try:
+        cutoff = (datetime.utcnow() - timedelta(days=FOLLOWUP_DELAY_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+        rows = conn.execute("""
+            SELECT email, name, instagram FROM leads
+            WHERE followup_sent = 0
+              AND audit_sent_at IS NOT NULL
+              AND audit_sent_at <= ?
+        """, (cutoff,)).fetchall()
+        return [{"email": r[0], "name": r[1], "instagram": r[2]} for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_followup_sent(email: str):
+    """Mark this lead's follow-up as sent."""
+    conn = get_db()
+    try:
+        conn.execute("UPDATE leads SET followup_sent = 1 WHERE email = ?", (email,))
+        conn.commit()
+    finally:
+        conn.close()
+
 
 # ─── System Prompt ────────────────────────────────────────────────────────────
 
@@ -154,9 +204,7 @@ Then write the audit based on what you actually find. Be specific — reference 
 
     print(f"  Researching @{instagram}...")
 
-    # Agentic loop — server-side tools may pause_turn if they need more iterations
     for _ in range(6):
-        # Retry up to 5 times on overload/rate limit
         for attempt in range(5):
             try:
                 response = client.messages.create(
@@ -180,17 +228,14 @@ Then write the audit based on what you actually find. Be specific — reference 
 
         messages.append({"role": "assistant", "content": response.content})
 
-        # Collect all text blocks
         for block in response.content:
             if block.type == "text" and block.text.strip():
                 print(f"    text block ({len(block.text)} chars): {block.text[:80]!r}")
 
         if response.stop_reason == "end_turn":
-            # Find text block that contains the audit markers
             for block in response.content:
                 if block.type == "text" and "SUBJECT:" in block.text:
                     return parse_audit(block.text)
-            # No markers found — return empty to trigger error
             break
 
         if response.stop_reason == "pause_turn":
@@ -360,6 +405,119 @@ def build_html(audit: dict) -> str:
 </html>"""
 
 
+# ─── Follow-up Email ──────────────────────────────────────────────────────────
+
+def build_followup_html(name: str) -> str:
+    """Build a short follow-up email nudging the lead to book a call."""
+    first = name.split()[0] if name else "there"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Following Up — FlyListed</title>
+</head>
+<body style="margin:0;padding:0;background:#f0f0f0;font-family:'Inter',Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f0f0f0;padding:24px 0;">
+<tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:4px;overflow:hidden;max-width:600px;width:100%;">
+
+  <!-- Header -->
+  <tr><td style="background:#000000;padding:28px 40px;text-align:center;">
+    <div style="color:#ffffff;font-size:20px;font-weight:700;letter-spacing:3px;">FLYLISTED</div>
+    <div style="color:#666;font-size:11px;letter-spacing:3px;margin-top:4px;text-transform:uppercase;">Following Up</div>
+  </td></tr>
+
+  <!-- Gradient bar -->
+  <tr><td style="height:4px;background:linear-gradient(135deg,#833ab4,#fd1d1d,#fcb045);font-size:0;">&nbsp;</td></tr>
+
+  <!-- Body -->
+  <tr><td style="padding:40px;">
+
+    <p style="font-size:15px;color:#222;margin:0 0 20px 0;font-weight:600;">Hi {first},</p>
+
+    <p style="font-size:15px;color:#444;line-height:1.7;margin:0 0 20px 0;">
+      I sent over your social media audit last week and wanted to check in — did you get a chance to look it over?
+    </p>
+
+    <p style="font-size:15px;color:#444;line-height:1.7;margin:0 0 20px 0;">
+      If anything resonated or you have questions about the recommendations, I'd love to walk you through what we'd actually do for your brand. No pressure — just a quick call to see if there's a fit.
+    </p>
+
+    <p style="font-size:15px;color:#444;line-height:1.7;margin:0 0 32px 0;">
+      You can grab a time below whenever it works for you.
+    </p>
+
+    <!-- CTA -->
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:36px;">
+    <tr><td align="center">
+      <a href="{BOOK_LINK}"
+         style="display:inline-block;background:linear-gradient(135deg,#833ab4,#fd1d1d,#fcb045);color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:14px 36px;border-radius:8px;letter-spacing:0.5px;">
+        Book a Strategy Call
+      </a>
+    </td></tr>
+    </table>
+
+    <!-- Signature -->
+    <p style="font-size:14px;color:#555;line-height:1.6;margin:0;">
+      Paul Chareth<br>
+      <span style="color:#999;">FlyListed &mdash; Social Media Built for Growth</span><br>
+      <a href="https://content.flylisted.com" style="color:#833ab4;text-decoration:none;font-size:13px;">content.flylisted.com</a>
+    </p>
+
+  </td></tr>
+
+  <!-- Footer -->
+  <tr><td style="background:#f9f9f9;border-top:1px solid #eee;padding:20px 40px;text-align:center;">
+    <p style="font-size:12px;color:#aaa;margin:0;">FlyListed &bull; You requested a free Instagram audit from our website.</p>
+  </td></tr>
+
+</table>
+</td></tr>
+</table>
+</body>
+</html>"""
+
+
+def send_followup(lead: dict):
+    """Send the 7-day follow-up email."""
+    name  = lead.get("name", "")
+    email = lead.get("email", "")
+    first = name.split()[0] if name else "there"
+    subject = f"Hey {first} — did you get a chance to look at your audit?"
+    html    = build_followup_html(name)
+    plain   = (
+        f"Hi {first},\n\n"
+        "I sent over your social media audit last week and wanted to check in — "
+        "did you get a chance to look it over?\n\n"
+        "If anything resonated or you have questions, I'd love to walk you through "
+        "what we'd actually do for your brand.\n\n"
+        f"Book a call here: {BOOK_LINK}\n\n"
+        "Paul Chareth\nFlyListed"
+    )
+    print(f"  Sending follow-up to {email}...")
+    if send_email(email, name, subject, html, plain):
+        mark_followup_sent(email)
+        print(f"  Follow-up sent to {email}")
+
+
+# ─── Follow-up Scheduler ──────────────────────────────────────────────────────
+
+def run_followup_scheduler():
+    """Background thread: check every hour for follow-ups due."""
+    print("  Follow-up scheduler started (checks every hour)")
+    while True:
+        try:
+            due = get_followup_due()
+            if due:
+                print(f"  {len(due)} follow-up(s) due")
+                for lead in due:
+                    send_followup(lead)
+        except Exception as e:
+            print(f"  Follow-up scheduler error: {e}")
+        time.sleep(3600)  # check every hour
+
+
 # ─── Email Sending ────────────────────────────────────────────────────────────
 
 def send_email(to_email: str, to_name: str, subject: str, html: str, plain: str = "") -> bool:
@@ -412,7 +570,7 @@ def send_email(to_email: str, to_name: str, subject: str, html: str, plain: str 
 # ─── Full Pipeline ────────────────────────────────────────────────────────────
 
 def process_lead(lead: dict) -> bool:
-    """Research lead, generate audit, build email, send."""
+    """Research lead, generate audit, build email, send, record for follow-up."""
     name  = lead.get("name", "there")
     email = lead.get("email", "").strip()
 
@@ -438,10 +596,13 @@ def process_lead(lead: dict) -> bool:
     print("  Building email...")
     html = build_html(audit)
 
-    subject = audit.get("subject") or f"Your Free Instagram Audit &mdash; Here's What We Found"
+    subject = audit.get("subject") or "Your Free Instagram Audit — Here's What We Found"
     plain   = audit.get("raw", "")
 
-    return send_email(email, name, subject, html, plain)
+    success = send_email(email, name, subject, html, plain)
+    if success:
+        save_lead(lead)  # record for 7-day follow-up
+    return success
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -451,9 +612,9 @@ def cli():
     parser.add_argument("--name",      default="",  help="Lead's first name")
     parser.add_argument("--email",     default="",  help="Lead's email address")
     parser.add_argument("--instagram", default="",  help="Instagram handle (with or without @)")
-    parser.add_argument("--business",  default="",     help="Business name (optional)")
-    parser.add_argument("--website",   default="",     help="Website URL (optional)")
-    parser.add_argument("--industry",  default="",     help="Industry / business type (optional)")
+    parser.add_argument("--business",  default="",  help="Business name (optional)")
+    parser.add_argument("--website",   default="",  help="Website URL (optional)")
+    parser.add_argument("--industry",  default="",  help="Industry / business type (optional)")
     parser.add_argument("--server",    action="store_true", help="Run as webhook server instead")
     parser.add_argument("--port",      type=int, default=5050, help="Webhook server port (default 5050)")
 
@@ -488,16 +649,18 @@ def run_server(port: int = 5050):
 
     app = Flask(__name__)
 
+    # Start follow-up scheduler in background
+    scheduler = threading.Thread(target=run_followup_scheduler, daemon=True)
+    scheduler.start()
+
     @app.route("/webhook/audit", methods=["GET", "POST"])
     def receive_lead():
         if request.method == "GET":
             return jsonify({"status": "ok"}), 200
-        # Accept JSON or form-encoded data
         data = request.get_json(silent=True) or request.form.to_dict()
         print(f"  Webhook payload keys: {list(data.keys())}")
         print(f"  Webhook payload: {data}")
 
-        # Mailchimp sends nested keys like data[email], data[merges][FNAME], etc.
         def mc(key):
             return data.get(f"data[{key}]") or data.get(f"data[merges][{key}]") or ""
 
@@ -513,7 +676,6 @@ def run_server(port: int = 5050):
         if not lead["email"]:
             return jsonify({"error": "email is required"}), 400
 
-        # Fire-and-forget in background thread so webhook returns immediately
         thread = threading.Thread(target=process_lead, args=(lead,), daemon=True)
         thread.start()
 
@@ -526,8 +688,6 @@ def run_server(port: int = 5050):
     print(f"\nFlyListed Audit Generator running on port {port}")
     print(f"POST to: http://localhost:{port}/webhook/audit")
     print(f"Health:  http://localhost:{port}/health\n")
-    print("Required fields: email, instagram")
-    print("Optional fields: name, business_name, website, industry\n")
     app.run(host="0.0.0.0", port=port, debug=False)
 
 
